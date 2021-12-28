@@ -1,0 +1,591 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+rm(list = setdiff(ls(), lsf.str()))
+```
+
+
+## Loading the data.
+
+This code is the same as in the file 01_Exact_Replication.rmd. Therefore it is used with the flag "include=FALSE". As a result the code is not visible in the html file. Skip to line 192 to skip the code that is similar to the previous file.
+
+
+
+```{r Imports 1, include=FALSE}
+
+library(foreign)
+packageVersion("foreign")     # 0.8.72
+library(ggplot2)
+packageVersion("ggplot2")     # 3.2.0
+
+library(tm)
+packageVersion("tm")          # 0.7.6
+packageVersion("NLP")         # 0.1.11       Package is loaded as dependency from tm
+library(SnowballC)
+packageVersion("SnowballC")   # 0.6.0
+library(plyr)
+packageVersion("plyr")        # 1.8.4
+library(twitteR)
+packageVersion("twitteR")     # 1.1.9
+library(slam)
+packageVersion("slam")        # 0.1.45
+library(caret)
+packageVersion("caret")       # 6.0.84
+packageVersion("lattice")     # 0.20.38      Package is loaded as dependency from caret
+library(ranger)
+packageVersion("ranger")      # 0.11.2
+library(rpart)
+packageVersion("rpart")       # 4.1.15
+library(rpart.plot)
+packageVersion("rpart.plot")  # 3.0.8
+library(xgboost)
+packageVersion("xgboost")     # 0.90.0.2
+library(e1071)
+packageVersion("e1071")       # 1.7.2
+```
+
+```{r Read Hand Coded Data, include=FALSE}
+data = read.csv("../data/coded-tweet-data.csv")
+attach(data)
+```
+
+
+```{r Text Cleaner, include=FALSE}
+text_cleaner<-function(corpus, remove_stopwords = TRUE, apply_stemming = TRUE, lowercasing = TRUE){
+  tempcorpus = lapply(corpus,toString)
+  
+  pb <- txtProgressBar(min = 0,      # Minimum value of the progress bar
+                     max = length(tempcorpus), # Maximum value of the progress bar
+                     style = 3,    # Progress bar style (also available style = 1 and style = 2)
+                     width = 100,   # Progress bar width. Defaults to getOption("width")
+                     char = "=")   # Character used to create the bar
+  
+  for(i in 1:length(tempcorpus)){
+     
+    tempcorpus[[i]]<-iconv(tempcorpus[[i]], "ASCII", "UTF-8", sub="")
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  if (lowercasing){
+     print("!!! LOWERCASING !!!")
+     tempcorpus = lapply(tempcorpus, tolower)
+  }
+  
+  tempcorpus<-Corpus(VectorSource(tempcorpus))
+  toSpace <- content_transformer(function (x , pattern ) gsub(pattern, "", x))
+  
+  #Removing all the special charecters and words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "@")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "\\|")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "#")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "http")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "https")
+  tempcorpus <- tm_map(tempcorpus, toSpace, ".com")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "$")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "+")
+  tempcorpus <- tm_map(tempcorpus, removeNumbers)
+  # Remove english common stopwords
+  if (remove_stopwords){
+     print("!!! STOPWORDS !!!")
+     tempcorpus <- tm_map(tempcorpus, removeWords, stopwords("english"))
+  }
+  # Remove punctuation
+  tempcorpus <- tm_map(tempcorpus, removePunctuation)
+  
+  # Eliminate extra white spaces
+  tempcorpus <- tm_map(tempcorpus, stripWhitespace)
+  # Stem the document
+  tempcorpus <- tm_map(tempcorpus, PlainTextDocument)
+  if (apply_stemming){
+     print(print("!!! STEMMING !!!"))
+     tempcorpus <- tm_map(tempcorpus,  stemDocument, "english")
+  }
+  
+  # Remove uninformative high-frequency words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "amp")
+  return(tempcorpus)
+}
+```
+
+
+```{r}
+my_precision <- function(Y_pred, Y_true, class_of_interest = NULL){  # If class_of_interest == 0 then precision is equal to accuracy
+   if (is.null(class_of_interest)) {
+      tp = sum(Y_pred == Y_true)
+      fp = sum(Y_pred != Y_true)
+   }
+   else{
+      tp = sum(Y_pred == class_of_interest & Y_true == class_of_interest)
+      fp = sum(Y_pred == class_of_interest & Y_true != class_of_interest)
+   }
+   
+   return(tp/(tp+fp))
+   
+}
+
+my_recall <- function(Y_pred, Y_true, class_of_interest){
+   tp = sum(Y_pred == class_of_interest & Y_true == class_of_interest)
+   fn = sum(Y_pred != class_of_interest & Y_true == class_of_interest)
+   
+   
+   return(tp/(tp+fn))
+   
+}
+
+my_f_measure <- function(P, R, Beta = 1){
+   return( (1+Beta**2) * ( (P*R)/(Beta**2 * P + R) )  )
+}
+```
+
+```{r}
+Anastastopoulos_training_procedure <- function(seed, dtm_mat2){
+   moralJason<-ifelse(JasonCode == 2 , 1, 0)
+   moral = moralJason
+   #print(dim(dtm_mat2))
+   set.seed(seed)
+   
+   mllabel = data.frame(moral,dtm_mat2)
+   
+   train=sample(1:dim(mllabel)[1],
+                dim(mllabel)[1]*0.7)
+   #dtm_mat<-as.matrix(dtm)
+   trainX = dtm_mat2[train,]
+   testX = dtm_mat2[-train,]
+   trainY = moral[train]
+   testY = moral[-train]
+   
+   traindata<-data.frame(trainY,trainX)
+   testdata<-data.frame(testY,testX)
+   
+   # print(dim(traindata))
+   # readline("something")
+   
+   traindata.b <- xgb.DMatrix(data = trainX,label = trainY) 
+   testdata.b  <- xgb.DMatrix(data = testX,label=testY)
+   
+   pospredweight = as.vector(table(trainY)[1])/as.vector(table(trainY)[2])
+   
+   set.seed(100)
+   
+   # Parameter tuning
+   # these are default parameters
+   params <- list(booster = "gbtree", objective = "binary:logistic", 
+                  eta=0.3, gamma=0, max_depth=6, min_child_weight=1, 
+                  subsample=1, colsample_bytree=1)
+   
+   xgbcv <- xgb.cv( params = params, data = traindata.b,
+                    nrounds = 100, nfold = 5, showsd = T, 
+                    stratified = T, early.stopping.rounds = 20, print.every_n = 10,
+                    maximize = F,
+                    scale_pos_weight = pospredweight, verbose = 0)
+   
+   # Which number of iterations has the lowest training error?
+   best.iter = which(xgbcv$evaluation_log$test_error_mean ==  min(xgbcv$evaluation_log$test_error_mean))
+   best.iter = best.iter[1]
+   
+   #first default - model training
+   xgb1 <- xgb.train(params = params, data = traindata.b, 
+                     nrounds = best.iter, 
+                     watchlist = list(val=testdata.b,train=traindata.b),
+                     print.every_n = 10, early_stopping_rounds = 10, 
+                     maximize = F , eval_metric = "error",
+                     scale_pos_weight = pospredweight, verbose = 0)
+   
+   #model prediction
+   xgbpred <- predict(xgb1,testdata.b)
+   xgbpred <- ifelse(xgbpred > 0.5,1,0)
+
+   return( rbind(xgbpred, testY) )
+}
+
+```
+
+```{r}
+run_all <- function(experiment_name, remove_stopwords = TRUE, apply_stemming = TRUE, lowercasing = TRUE, remove_sparse=TRUE, nr_seeds=1000){
+   cleantweets <- text_cleaner(data$Text, remove_stopwords=remove_stopwords, apply_stemming=apply_stemming, lowercasing=lowercasing)
+   
+   dtm<-DocumentTermMatrix(cleantweets)
+   
+   #View(dtm)
+   
+   dtm_filename = paste('../data/dtm_before_',experiment_name,'.csv', sep='')
+   write.csv(as.matrix(dtm), dtm_filename)
+   dict_size_before_sparse_removal = dim(dtm)[2]
+   print(dict_size_before_sparse_removal)
+   
+   print(dim(dtm))
+   # readline(prompt="Dims after preproc: ")
+   # TODO also make this optional
+   if (remove_sparse){
+      print("!!! SPARSE !!!")
+      dtm <- removeSparseTerms(dtm, sparse=0.98)   
+   }
+   dtm_filename = paste('../data/dtm_after_',experiment_name,'.csv', sep='')
+   write.csv(as.matrix(dtm), dtm_filename)
+   
+   dict_size_after_sparse_removal = dim(dtm)[2]
+   print(dim(dtm))
+   print(dict_size_after_sparse_removal)
+   # readline(prompt="Dims after remove sparse terms: ")
+   
+   dtm_mat<-as.matrix(dtm)
+   
+   twitterdata<-read.csv("../data/agency_tweets_database.csv")
+   tweetstext = twitterdata$tweet_text
+   
+   # Clean the text
+   tweetstext = sapply(tweetstext,toString)
+   
+   cleanads <- text_cleaner(tweetstext, remove_stopwords=remove_stopwords, apply_stemming=apply_stemming, lowercasing=lowercasing)
+   
+   moralJason <- ifelse(JasonCode == 2 , 1, 0)
+   
+   ############## Expert coder
+   moral = moralJason
+   mllabel = data.frame(moral, dtm_mat)
+   
+   set.seed(41616)
+   train=sample(1:dim(mllabel)[1],
+                dim(mllabel)[1]*0.7)
+   
+   dtm_mat<-as.matrix(dtm)
+   trainX = dtm_mat[train,]
+   print(dim(trainX))
+   
+   testX = dtm_mat[-train,]
+   print(dim(testX))
+   
+   trainY = moral[train]
+   testY = moral[-train]
+   
+   traindata<-data.frame(trainY,trainX)
+   testdata<-data.frame(testY,testX)
+   
+   traindata.b <- xgb.DMatrix(data = trainX,label = trainY) 
+   testdata.b  <- xgb.DMatrix(data = testX,label=testY)
+   
+   pospredweight = as.vector(table(trainY)[1])/as.vector(table(trainY)[2])
+   
+   # dtm_all_ads is a sparse matrix in python terminology.
+   dtm_all_ads<-DocumentTermMatrix(cleanads)    # <-- make document term matrix of all the cleaned unseen tweets
+   
+   trainset_colnames<-colnames(trainX)          # <-- retrieve the column names of the training set
+   m <- matrix(0, ncol = length(trainset_colnames), nrow = dtm_all_ads[["nrow"]])      # <-- initialize an all-zero matrix. The columns are the word features from the training dtm. The rows represent the unseen tweets.
+
+  pb <- txtProgressBar(min = 0,      # Minimum value of the progress bar
+                  max = length(dtm_all_ads[["i"]]), # Maximum value of the progress bar
+                  style = 3,    # Progress bar style (also available style = 1 and style = 2)
+                  width = 100,   # Progress bar width. Defaults to getOption("width")
+                  char = "=")   # Character used to create the bar
+   for (idx in 1:length(dtm_all_ads[["i"]])){      # <-- Iterate over all the (non-zero) values in the sparse matrix
+      i = dtm_all_ads[["i"]][idx]                  # <-- Get the row coordinate of the nth (idx-th) value
+      j = dtm_all_ads[["j"]][idx]                  # <-- Get the collumn coordinate of the nth (idx-th) value
+      value = dtm_all_ads[["v"]][idx]              # <-- Get the value (word count) of the nth value
+      
+      word = dtm_all_ads[["dimnames"]][["Terms"]][j]                 # <-- retrieve the word that corresponds with the collumn index
+      word_index = match(word, trainset_colnames, nomatch = FALSE)   # <-- See whether the word is present as a feature in the training dtm. If it is, get the column index of the word in the training data. If it is not present, return false.
+      
+      if (word_index){                 # <-- if word_index == False, then the condition fails, if word index contains an actual index, the condition passes.
+         m[i, word_index] = value      # <-- add the value to the pre-initialized matrix
+      }
+      setTxtProgressBar(pb, i)
+   }
+   close(pb)
+   
+   print(dim(trainX))      # <-- produce some output to assess the result
+   
+   print(dim(m))           # <-- produce some output to assess the result
+   
+   dtm_mat_class <- m      # <-- assign to a new name so that the rest of the script will run normally.
+   
+   dtm_filename = paste('../data/dtm_after_all_tweets_',experiment_name,'.csv', sep='')
+   write.csv(as.matrix(m), dtm_filename)
+   
+   options(scipen=999)
+
+   seedlist = c(41616, 1:nr_seeds)
+   # seedlist = c(41616, 1:100)
+   results_splitseed = data.frame(matrix(NA, nrow = length(seedlist), ncol = 10))
+   colnames(results_splitseed) = c("P1", "R1", "F1", "probability 1", "prob ratio 1" ,"P0", "R0", "F0", "probability 0", "prob ratio 0")
+   
+   
+   pb <- txtProgressBar(min = 0,      # Minimum value of the progress bar
+                        max = length(seedlist), # Maximum value of the progress bar
+                        style = 3,    # Progress bar style (also available style = 1 and style = 2)
+                        width = 100,   # Progress bar width. Defaults to getOption("width")
+                        char = "=")   # Character used to create the bar
+   
+   for (i in 1:length(seedlist)){
+      
+      seed = seedlist[i]
+      x = Anastastopoulos_training_procedure(seed, dtm_mat)
+   
+      Y_pred  =  x[1,]
+      testY   =  x[2,]
+      
+      
+      P1 = my_precision(Y_pred, testY, class_of_interest = 1)
+      R1 = my_recall(Y_pred, testY, class_of_interest = 1)
+      
+         
+      results_splitseed['P1'][i,] = P1
+      results_splitseed['R1'][i,] = R1
+      results_splitseed['F1'][i,] = my_f_measure(P1, R1)
+      
+      P0 = my_precision(Y_pred, testY, class_of_interest = 0)
+      R0 = my_recall(Y_pred, testY, class_of_interest = 0)
+      
+      results_splitseed['P0'][i,] = P0
+      results_splitseed['R0'][i,] = R0
+      results_splitseed['F0'][i,] = my_f_measure(P0, R0)
+   
+      results_splitseed["probability 1"][i,] = sum(testY == 1)/ length(testY)
+      results_splitseed["probability 0"][i,] = sum(testY == 0)/ length(testY)   
+      
+      setTxtProgressBar(pb, i)
+   }
+   close(pb)
+   
+   results_splitseed["prob ratio 1"] = results_splitseed['P1']/results_splitseed["probability 1"]
+   results_splitseed["prob ratio 0"] = results_splitseed['P0']/results_splitseed["probability 0"]
+   
+   results_splitseed["seed"] = seedlist
+   
+   results_splitseed
+   result_means = colMeans(results_splitseed)
+   as.double( result_means)
+   
+   result_sd = apply(results_splitseed, 2, sd)
+   print(as.double(result_sd))
+   
+   returnobj = list("results_splitseed" = results_splitseed, "dict_size_before_sparse_removal" = dict_size_before_sparse_removal, "dict_size_after_sparse_removal" = dict_size_after_sparse_removal)
+   
+   return(returnobj)
+}
+```
+
+
+```{r}
+
+seeds_count = 1000
+
+print("++++++++++ VANILLA ++++++++++")
+experiment_results_vanilla = run_all('AW', nr_seeds = seeds_count)
+results_vanilla = experiment_results_vanilla$results_splitseed
+write.csv(results_vanilla, "../data/results_vanilla.csv", sep="\t")
+
+print("++++++++++ STOPWORDS ++++++++++")
+experiment_results_stopword = run_all('stopwords',remove_stopwords = FALSE, nr_seeds = seeds_count)
+results_no_stopword_removal = experiment_results_stopword$results_splitseed
+write.csv(results_no_stopword_removal, "../data/stopwords.csv", sep="\t")
+
+print("++++++++++ STEMMING ++++++++++")
+experiment_results_stemming = run_all('stemming',apply_stemming = FALSE, nr_seeds = seeds_count)
+results_no_stemming = experiment_results_stemming$results_splitseed
+write.csv(results_no_stemming, "../data/stemming.csv", sep="\t")
+
+print("++++++++++ LOWERCASING ++++++++++")
+experiment_results_lowercasing = run_all('lowercasing', lowercasing = FALSE, nr_seeds = seeds_count)
+results_no_lowercasing = experiment_results_lowercasing$results_splitseed
+write.csv(results_no_lowercasing, "../data/lowercasing.csv", sep="\t")
+
+print("++++++++++ SPARSE ++++++++++")
+experiment_results_sparse = run_all('sparse' , remove_sparse = FALSE, nr_seeds = seeds_count)
+results_no_sparse_removal = experiment_results_sparse$results_splitseed
+write.csv(results_no_sparse_removal, "../data/sparse.csv", sep="\t")
+
+print("++++++++++ STEMMING AND SPARSE ++++++++++")
+experiment_results_stemming_sparse = run_all('stemming_and_sparse' ,apply_stemming = FALSE, remove_sparse = FALSE, nr_seeds = seeds_count)
+results_no_stemming_and_sparse = experiment_results_stemming_sparse$results_splitseed
+write.csv(results_no_stemming, "../data/stemming_and_sparse.csv", sep="\t")
+
+print("++++++++++ LOWERCASING AND SPARSE ++++++++++")
+experiment_results_lowercasing_sparse = run_all('lowercasing_and_sparse',lowercasing = FALSE, remove_sparse = FALSE, nr_seeds = seeds_count)
+results_no_lowercasing_and_sparse = experiment_results_lowercasing_sparse$results_splitseed
+write.csv(results_no_stemming, "../data/lowercasing_and_sparse.csv", sep="\t")
+
+results_data <- data.frame(Vanilla = results_vanilla$P1,
+                           Stopwords = results_no_stopword_removal$P1,
+                           Stemming = results_no_stemming$P1,
+                           Lowercasing = results_no_lowercasing$P1,
+                           Sparse = results_no_sparse_removal$P1,
+                           Stemming_and_Sparse = results_no_stemming_and_sparse,
+                           Lowercasing_and_Sparse = results_no_lowercasing_and_sparse)
+
+
+
+#plot.new()
+#jpeg("../figures/splitseed_boxplot_preproc_comparison_a105.jpeg", width = 200, height = 175, units = 'mm', res = 600)
+#boxplot(results_vanilla$P1, xlab = 'Vanilla', ylim = c(0,1), horizontal = F)
+#boxplot(results_no_stopword_removal$P1, xlab = 'No stopword rmoval', ylim = c(0,1), horizontal = F)
+#boxplot(results_no_stemming$P1, xlab = 'No Stemming', ylim = c(0,1), horizontal = F)
+#boxplot(results_no_lowercasing$P1, xlab = 'No lowercasing', ylim = c(0,1), horizontal = F)
+
+#boxplot(results_data, ylim = c(0,1))
+#title("Range of \nPrecision values")
+#abline(h=0.867, col='red')
+
+#dev.off()
+print(mean(results_data$Vanilla))
+print(mean(results_data$Stopwords))
+print(mean(results_data$Stemming))
+print(mean(results_data$Lowercasing))
+
+#dictlosstable = data.frame()
+
+
+
+```
+```{r}
+my_colnames = c('experiment', 'dict size before', 'dict size after', 'difference')
+rownames = c("A&W", "stopwords", "stemming", "lowercasing", "sparse", "stemming and sparse", "lowercasing and sparse" )
+dict_sizes_before = c(experiment_results_vanilla$dict_size_before_sparse_removal, experiment_results_stopword$dict_size_before_sparse_removal, experiment_results_stemming$dict_size_before_sparse_removal, experiment_results_lowercasing$dict_size_before_sparse_removal, experiment_results_sparse$dict_size_before_sparse_removal, experiment_results_stemming_sparse$dict_size_before_sparse_removal, experiment_results_lowercasing_sparse$dict_size_before_sparse_removal)
+
+dict_sizes_after = c(experiment_results_vanilla$dict_size_after_sparse_removal, experiment_results_stopword$dict_size_after_sparse_removal, experiment_results_stemming$dict_size_after_sparse_removal, experiment_results_lowercasing$dict_size_after_sparse_removal, experiment_results_sparse$dict_size_after_sparse_removal, experiment_results_stemming_sparse$dict_size_after_sparse_removal, experiment_results_lowercasing_sparse$dict_size_after_sparse_removal)
+
+difference = dict_sizes_before - dict_sizes_after
+
+dict_size_table = data.frame(rownames, dict_sizes_before, dict_sizes_after, difference)
+colnames(dict_size_table) = my_colnames
+
+
+write.csv(dict_size_table, file = "../data/dict_sizes.csv")
+
+```
+
+```{r}
+results_vanilla = read.csv("../data/results_vanilla.csv")
+results_no_stopword_removal = read.csv("../data/stopwords.csv")
+results_no_stemming = read.csv("../data/stemming.csv")
+results_no_lowercasing = read.csv("../data/stemming.csv")
+results_no_sparse_removal = read.csv("../data/sparse.csv")
+```
+
+
+
+```{r}
+results_data <- data.frame(Vanilla = results_vanilla$P1,
+                           Stopwords = results_no_stopword_removal$P1,
+                           Stemming = results_no_stemming$P1,
+                           Lowercasing = results_no_lowercasing$P1,
+                           Sparse = results_no_sparse_removal$P1,
+                           Stemming_and_Sparse = results_no_stemming_and_sparse$P1,
+                           Lowercasing_and_Sparse = results_no_lowercasing_and_sparse$P1)
+
+
+
+plot.new()
+jpeg("../figures/splitseed_boxplot_preproc_comparison_1000.jpeg", width = 200, height = 175, units = 'mm', res = 600)
+
+mynames = c('A&W\npipeline', 'no stop word\nremoval','no stemming','no lowercasing','no sparse\nterm removal', 'no stemming\nno sparse\nterm removal', 'no lowercasing\nno sparse\nterm removal')
+
+boxplot(results_data,  xaxt = "n", yaxt = "n") #ylim = c(0,1),
+axis(side = 2, las = 2, mgp = c(3, 0.75, 0))
+
+text(x = 1:length(mynames),
+     y = - 0.1,
+     labels = mynames,
+     xpd = NA,
+     cex = 0.8)
+
+title("Range of \nPrecision values")
+abline(h=0.867, col='red')
+
+
+
+dev.off()
+```
+
+
+```{r}
+recalls_data <- data.frame(Vanilla = results_vanilla$R0,
+                           Stopwords = results_no_stopword_removal$R0,
+                           Stemming = results_no_stemming$R0,
+                           Lowercasing = results_no_lowercasing$R0,
+                           Sparse = results_no_sparse_removal$R0,
+                           Stemming_and_Sparse = results_no_stemming_and_sparse$R0,
+                           Lowercasing_and_Sparse = results_no_lowercasing_and_sparse$R0)
+
+
+
+plot.new()
+jpeg("../figures/recalls_0_1000.jpeg", width = 200, height = 175, units = 'mm', res = 600)
+
+mynames = c('A&W\npipeline', 'no stopwoord\nremoval','no stemming','no lowercasing','no sparse\nterm removal', 'no stemming\nno sparse\nterm removal', 'no lowercasing\nno sparse\nterm removal')
+
+boxplot(recalls_data,  xaxt = "n", yaxt = "n") #ylim = c(0,1),
+axis(side = 2, las = 2, mgp = c(3, 0.75, 0))
+
+text(x = 1:length(mynames),
+     y = - 0.1,
+     labels = mynames,
+     xpd = NA,
+     cex = 0.8)
+
+title("Range of \nRecall values")
+abline(h=0.867, col='red')
+
+
+
+dev.off()
+
+```
+
+```{r}
+F1_data <- data.frame(Vanilla = results_vanilla$F1,
+                           Stopwords = results_no_stopword_removal$F1,
+                           Stemming = results_no_stemming$F1,
+                           Lowercasing = results_no_lowercasing$F1,
+                           Sparse = results_no_sparse_removal$F1,
+                           Stemming_and_Sparse = results_no_stemming_and_sparse$F1,
+                           Lowercasing_and_Sparse = results_no_lowercasing_and_sparse$F1)
+
+
+
+plot.new()
+jpeg("../figures/F1_1_1000.jpeg", width = 200, height = 175, units = 'mm', res = 600)
+
+mynames = c('A&W\npipeline', 'no stopwoord\nremoval','no stemming','no lowercasing','no sparse\nterm removal', 'no stemming\nno sparse\nterm removal', 'no lowercasing\nno sparse\nterm removal')
+
+boxplot(F1_data,  xaxt = "n", yaxt = "n") #ylim = c(0,1),
+axis(side = 2, las = 2, mgp = c(3, 0.75, 0))
+
+text(x = 1:length(mynames),
+     y = - 0.1,
+     labels = mynames,
+     xpd = NA,
+     cex = 0.8)
+
+title("Range of \nRecall values")
+abline(h=0.867, col='red')
+
+
+
+dev.off()
+
+```
+
+
+```{r}
+# install.packages("vioplot")
+library("vioplot")
+vioplot(results_data)
+abline(h=0.867, col='red')
+```
+
+
+```{r}
+hist(results_data$Vanilla)
+```
+
+```{r}
+hist(results_data$Stopwords)
+```
+
+

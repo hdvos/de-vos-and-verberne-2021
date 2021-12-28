@@ -1,0 +1,469 @@
+---
+title: "Robustness tests"
+author: "<Masked for review>"
+date: "12/2/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Loading the data.
+
+This code is the same as in the file 01_Exact_Replication.rmd. Therefore it is used with the flag "include=FALSE". As a result the code is not visible in the html file. Skip to line 192 to skip the code that is similar to the previous file.
+
+```{r Imports 1, include=FALSE}
+library(foreign)
+packageVersion("foreign")     # 0.8.72
+library(ggplot2)
+packageVersion("ggplot2")     # 3.2.0
+
+library(tm)
+packageVersion("tm")          # 0.7.6
+packageVersion("NLP")         # 0.1.11       Package is loaded as dependency from tm
+library(SnowballC)
+packageVersion("SnowballC")   # 0.6.0
+library(plyr)
+packageVersion("plyr")        # 1.8.4
+library(twitteR)
+packageVersion("twitteR")     # 1.1.9
+library(slam)
+packageVersion("slam")        # 0.1.45
+library(caret)
+packageVersion("caret")       # 6.0.84
+packageVersion("lattice")     # 0.20.38      Package is loaded as dependency from caret
+library(ranger)
+packageVersion("ranger")      # 0.11.2
+library(rpart)
+packageVersion("rpart")       # 4.1.15
+library(rpart.plot)
+packageVersion("rpart.plot")  # 3.0.8
+library(xgboost)
+packageVersion("xgboost")     # 0.90.0.2
+library(e1071)
+packageVersion("e1071")       # 1.7.2
+```
+
+```{r Read Hand Coded Data, include=FALSE}
+data = read.csv("../data/coded-tweet-data.csv")
+attach(data)
+```
+
+
+
+```{r Text Cleaner, include=FALSE}
+text_cleaner<-function(corpus, remove_stopwords = TRUE, apply_stemming = TRUE, lowercasing = TRUE){
+  tempcorpus = lapply(corpus,toString)
+  
+  pb <- txtProgressBar(min = 0,      # Minimum value of the progress bar
+                     max = length(tempcorpus), # Maximum value of the progress bar
+                     style = 3,    # Progress bar style (also available style = 1 and style = 2)
+                     width = 100,   # Progress bar width. Defaults to getOption("width")
+                     char = "=")   # Character used to create the bar
+  
+  for(i in 1:length(tempcorpus)){
+    tempcorpus[[i]]<-iconv(tempcorpus[[i]], "ASCII", "UTF-8", sub="")
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  if (lowercasing){
+     tempcorpus = lapply(tempcorpus, tolower)
+  }
+  
+  tempcorpus<-Corpus(VectorSource(tempcorpus))
+  toSpace <- content_transformer(function (x , pattern ) gsub(pattern, "", x))
+  
+  #Removing all the special charecters and words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "@")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "\\|")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "#")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "http")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "https")
+  tempcorpus <- tm_map(tempcorpus, toSpace, ".com")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "$")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "+")
+  tempcorpus <- tm_map(tempcorpus, removeNumbers)
+  # Remove english common stopwords
+  if (remove_stopwords){
+     tempcorpus <- tm_map(tempcorpus, removeWords, stopwords("english"))
+  }
+  # Remove punctuation
+  tempcorpus <- tm_map(tempcorpus, removePunctuation)
+  
+  # Eliminate extra white spaces
+  tempcorpus <- tm_map(tempcorpus, stripWhitespace)
+  # Stem the document
+  tempcorpus <- tm_map(tempcorpus, PlainTextDocument)
+  if (apply_stemming){
+     tempcorpus <- tm_map(tempcorpus,  stemDocument, "english")
+  }
+  
+  # Remove uninformative high-frequency words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "amp")
+  return(tempcorpus)
+}
+```
+
+```{r Cleaning the texts, include=FALSE}
+cleantweets <- text_cleaner(data$Text)
+```
+
+```{r Cereate DTM, include=FALSE}
+# Create TF-IDF
+dtm<-DocumentTermMatrix(cleantweets)
+
+print(dim(dtm))
+```
+
+```{r Remove sparse terms, include=FALSE}
+dtm <- removeSparseTerms(dtm, sparse=0.98)
+print(dim(dtm))
+```
+
+```{r DTM to dense, include=FALSE}
+dtm_mat<-as.matrix(dtm)
+```
+
+```{r Load and clean unseen, include=FALSE}
+twitterdata<-read.csv("../data/agency_tweets_database.csv")
+tweetstext = twitterdata$tweet_text
+
+# Clean the text
+tweetstext = sapply(tweetstext,toString)
+
+cleanads <- text_cleaner(tweetstext)
+```
+
+```{r, include=FALSE}
+moralJason<-ifelse(JasonCode == 2 , 1, 0)
+```
+
+
+```{r Prepare Data Structures, include=FALSE}
+############## Expert coder
+moral = moralJason
+mllabel = data.frame(moral, dtm_mat)
+
+```
+
+
+```{r, include = FALSE}
+set.seed(41616)
+train=sample(1:dim(mllabel)[1],
+             dim(mllabel)[1]*0.7)
+
+dtm_mat<-as.matrix(dtm)
+trainX = dtm_mat[train,]
+print(dim(trainX))
+
+testX = dtm_mat[-train,]
+print(dim(testX))
+
+trainY = moral[train]
+testY = moral[-train]
+
+traindata<-data.frame(trainY,trainX)
+testdata<-data.frame(testY,testX)
+
+traindata.b <- xgb.DMatrix(data = trainX,label = trainY) 
+testdata.b  <- xgb.DMatrix(data = testX,label=testY)
+
+pospredweight = as.vector(table(trainY)[1])/as.vector(table(trainY)[2])
+```
+
+```{r Create DTM for unseen data., include=FALSE}
+
+# dtm_all_ads is a sparse matrix in python terminology.
+dtm_all_ads<-DocumentTermMatrix(cleanads)    # <-- make document term matrix of all the cleaned unseen tweets
+
+trainset_colnames<-colnames(trainX)          # <-- retrieve the column names of the training set
+m <- matrix(0, ncol = length(trainset_colnames), nrow = dtm_all_ads[["nrow"]])      # <-- initialize an all-zero matrix. The columns are the word features from the training dtm. The rows represent the unseen tweets.
+
+for (idx in 1:length(dtm_all_ads[["i"]])){      # <-- Iterate over all the (non-zero) values in the sparse matrix
+   i = dtm_all_ads[["i"]][idx]                  # <-- Get the row coordinate of the nth (idx-th) value
+   j = dtm_all_ads[["j"]][idx]                  # <-- Get the collumn coordinate of the nth (idx-th) value
+   value = dtm_all_ads[["v"]][idx]              # <-- Get the value (word count) of the nth value
+   
+   word = dtm_all_ads[["dimnames"]][["Terms"]][j]                 # <-- retrieve the word that corresponds with the collumn index
+   word_index = match(word, trainset_colnames, nomatch = FALSE)   # <-- See whether the word is present as a feature in the training dtm. If it is, get the column index of the word in the training data. If it is not present, return false.
+   
+   if (word_index){                 # <-- if word_index == False, then the condition fails, if word index contains an actual index, the condition passes.
+      m[i, word_index] = value      # <-- add the value to the pre-initialized matrix
+   }
+   
+}
+
+print(dim(trainX))      # <-- produce some output to assess the result
+
+print(dim(m))           # <-- produce some output to assess the result
+
+dtm_mat_class <- m      # <-- assign to a new name so that the rest of the script will run normally.
+
+```
+
+## Evaluation Metrics
+
+First I will define some custom functions for evaluation to be sure that the evaluation metrics work the way I want.
+
+see: https://en.wikipedia.org/wiki/Precision_and_recall 
+
+Precision is the proportion of instances correctly classified as x (true positives(tp)) over all instances classified as x (true positives + false positives (fp)).
+
+Recall is the proportion of instances correctly classified as x (tp) and all instances labeled as x (true positives + false negatives (fn)).
+
+The advantage of precision and recall is that it is calculated per class and thus is robust for unbalanced datasets.
+
+Precision and Recall can be aggregated to Macro Average Precision/Recall and Micro Average Precision/Recall.
+
+It is often common to collate Precision and Recall in the F-measure: the harmonic mean between the two.
+
+Lets define functions for both (there are packages that offer implementations, but I think that redefining them here makes it more insightful)
+
+```{r}
+my_precision <- function(Y_pred, Y_true, class_of_interest = NULL){  # If class_of_interest == 0 then precision is equal to accuracy
+   if (is.null(class_of_interest)) {
+      tp = sum(Y_pred == Y_true)
+      fp = sum(Y_pred != Y_true)
+   }
+   else{
+      tp = sum(Y_pred == class_of_interest & Y_true == class_of_interest)
+      fp = sum(Y_pred == class_of_interest & Y_true != class_of_interest)
+   }
+   
+   return(tp/(tp+fp))
+   
+}
+
+my_recall <- function(Y_pred, Y_true, class_of_interest){
+   tp = sum(Y_pred == class_of_interest & Y_true == class_of_interest)
+   fn = sum(Y_pred != class_of_interest & Y_true == class_of_interest)
+   
+   
+   return(tp/(tp+fn))
+   
+}
+
+my_f_measure <- function(P, R, Beta = 1){
+   return( (1+Beta**2) * ( (P*R)/(Beta**2 * P + R) )  )
+}
+```
+
+```{r}
+a = c(1,1,0,0)
+b = c(1,0,1,0)
+
+print(my_precision(a, b, 1))
+```
+
+
+
+
+## Influence of random seed.
+
+Another way to investigate the robustness of a model is to assess the effect of the random seed. If a model is robust, the choice of random seed should not matter. For every different random seed the model should give more or less the same output.
+
+To give the model the best chance, we will use the settings from the original paper. We will only change the seed that is set just before making the data split. We will test their original seed (41616) as well as the seeds: 1, 2, 3, 4, 5, 6, 7, 8, 9 and 10.
+
+We will however use precision, recall and F-measure to evaluate the performance.
+
+### Create a function
+
+First put the whole procedure in a function to make experimentation easier.
+
+```{r}
+Anastastopoulos_training_procedure <- function(seed){
+   moralJason<-ifelse(JasonCode == 2 , 1, 0)
+   moral = moralJason
+   
+   set.seed(seed)
+   
+   mllabel = data.frame(moral,dtm_mat)
+   
+   train=sample(1:dim(mllabel)[1],
+                dim(mllabel)[1]*0.7)
+   dtm_mat<-as.matrix(dtm)
+   trainX = dtm_mat[train,]
+   testX = dtm_mat[-train,]
+   trainY = moral[train]
+   testY = moral[-train]
+   
+   traindata<-data.frame(trainY,trainX)
+   testdata<-data.frame(testY,testX)
+   
+   traindata.b <- xgb.DMatrix(data = trainX,label = trainY) 
+   testdata.b  <- xgb.DMatrix(data = testX,label=testY)
+   
+   pospredweight = as.vector(table(trainY)[1])/as.vector(table(trainY)[2])
+   
+   set.seed(100)
+   
+   # Parameter tuning
+   # these are default parameters
+   params <- list(booster = "gbtree", objective = "binary:logistic", 
+                  eta=0.3, gamma=0, max_depth=6, min_child_weight=1, 
+                  subsample=1, colsample_bytree=1)
+   
+   xgbcv <- xgb.cv( params = params, data = traindata.b,
+                    nrounds = 100, nfold = 5, showsd = T, 
+                    stratified = T, early.stopping.rounds = 20, print.every_n = 10,
+                    maximize = F,
+                    scale_pos_weight = pospredweight, verbose = 0)
+   
+   # Which number of iterations has the lowest training error?
+   best.iter = which(xgbcv$evaluation_log$test_error_mean ==  min(xgbcv$evaluation_log$test_error_mean))
+   best.iter = best.iter[1]
+   
+   #first default - model training
+   xgb1 <- xgb.train(params = params, data = traindata.b, 
+                     nrounds = best.iter, 
+                     watchlist = list(val=testdata.b,train=traindata.b),
+                     print.every_n = 10, early_stopping_rounds = 10, 
+                     maximize = F , eval_metric = "error",
+                     scale_pos_weight = pospredweight, verbose = 0)
+   
+   #model prediction
+   xgbpred <- predict(xgb1,testdata.b)
+   xgbpred <- ifelse(xgbpred > 0.5,1,0)
+
+   return( rbind(xgbpred, testY, trainY) )
+}
+
+```
+
+Now run the machine learning for 1001 random seeds: 1 to 1000 and the seed used by Anastasopoulos and Whitford (41616). Note that running the following cell will take a lot of time. If you want the code to run quicker, uncomment line 316. Then it will only run with 101 random seeds.
+
+```{r}
+options(scipen=999)
+
+seedlist = c(41616, 1:1000)
+# seedlist = c(41616, 1:100)
+results_splitseed = data.frame(matrix(NA, nrow = length(seedlist), ncol = 10))
+colnames(results_splitseed) = c("P1", "R1", "F1", "probability 1", "prob ratio 1" ,"P0", "R0", "F0", "probability 0", "prob ratio 0")
+
+
+pb <- txtProgressBar(min = 0,      # Minimum value of the progress bar
+                     max = length(seedlist), # Maximum value of the progress bar
+                     style = 3,    # Progress bar style (also available style = 1 and style = 2)
+                     width = 100,   # Progress bar width. Defaults to getOption("width")
+                     char = "=")   # Character used to create the bar
+
+for (i in 1:length(seedlist)){
+   
+   seed = seedlist[i]
+   x = Anastastopoulos_training_procedure(seed)
+
+   Y_pred  =  x[1,]
+   testY   =  x[2,]
+   Y_train =  x[3,]
+   
+   majority_value = strtoi(row.names( sort(table(trainY), decreasing = TRUE))[1])
+   majority = rep(majority_value ,length(Y_train))
+   
+   P1 = my_precision(Y_pred, testY, class_of_interest = 1)
+   R1 = my_recall(Y_pred, testY, class_of_interest = 1)
+   
+      
+   results_splitseed['P1'][i,] = P1
+   results_splitseed['R1'][i,] = R1
+   results_splitseed['F1'][i,] = my_f_measure(P1, R1)
+   
+   P0 = my_precision(Y_pred, testY, class_of_interest = 0)
+   R0 = my_recall(Y_pred, testY, class_of_interest = 0)
+   
+   results_splitseed['P0'][i,] = P0
+   results_splitseed['R0'][i,] = R0
+   results_splitseed['F0'][i,] = my_f_measure(P0, R0)
+
+   results_splitseed["probability 1"][i,] = sum(testY == 1)/ length(testY)
+   results_splitseed["probability 0"][i,] = sum(testY == 0)/ length(testY)   
+   
+   setTxtProgressBar(pb, i)
+}
+close(pb)
+
+results_splitseed["prob ratio 1"] = results_splitseed['P1']/results_splitseed["probability 1"]
+results_splitseed["prob ratio 0"] = results_splitseed['P0']/results_splitseed["probability 0"]
+
+results_splitseed["seed"] = seedlist
+
+results_splitseed
+result_means = colMeans(results_splitseed)
+as.double( result_means)
+
+result_sd = apply(results_splitseed, 2, sd)
+print(as.double(result_sd))
+
+```
+```{r}
+min(results_splitseed$P1)
+max(results_splitseed$P1)
+
+mean(results_splitseed$P1)
+sd(results_splitseed$P1)
+
+#print(mean(results_splitseed$P1) + sd(results_splitseed$P1))
+```
+
+
+
+## Create a boxplot
+
+```{r}
+plot.new()
+jpeg("../figures/splitseed_boxplot_horizontal.jpeg", width = 150, height = 80, units = 'mm', res = 600)
+boxplot(results_splitseed$P1, xlab = 'Precision', ylim = c(0,1), horizontal = T)
+title("Range of \nPrecision values")
+abline(v=0.867, col='red')
+
+dev.off()
+```
+
+
+
+
+
+## Create histograms
+
+(Not included in the paper.)
+
+```{r}
+print(length(results_splitseed))
+hist(results_splitseed$P1, breaks = 10)
+```
+
+
+
+
+```{r}
+which.max(results_splitseed$P1)
+sum(results_splitseed$P1 >= results_splitseed$P1[1]) -1
+
+# results_splitseed$P1[(results_splitseed$P1 >= results_splitseed$P1[1])]
+sum(results_splitseed$P1 == 1)
+```
+
+```{r}
+sum(results_splitseed$`prob ratio 1` < 1)
+```
+
+```{r}
+hist( results_splitseed['P1'][[1]])
+``` 
+```{r}
+hist( results_splitseed['prob ratio 1'][[1]])
+```
+
+Here you see a similar result: an average P1 of 0.58 an average probability 1 of 0.40 and pretty high standard deviations of 0.14 and .06 respectively, showing that the model performs only slightly (if at all) above chance.
+
+
+
+
+
+
+
+
+
+

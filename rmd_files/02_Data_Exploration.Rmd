@@ -1,0 +1,281 @@
+---
+title: "2 Data Exploration"
+author: "<Masked for review>"
+date: "29/11/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document contains the code for replicating section 3 of the paper.
+
+## Loading the data.
+
+This code is the same as in the file 01_Exact_Replication.rmd. Therefore it is used with the flag "include=FALSE". As a result the code is not visible in the html file. Skip to line 192 to skip the code that is similar to the previous file.
+
+```{r Imports 1, include=FALSE}
+library(foreign)
+packageVersion("foreign")     # 0.8.72
+library(ggplot2)
+packageVersion("ggplot2")     # 3.2.0
+
+library(tm)
+packageVersion("tm")          # 0.7.6
+packageVersion("NLP")         # 0.1.11       Package is loaded as dependency from tm
+library(SnowballC)
+packageVersion("SnowballC")   # 0.6.0
+library(plyr)
+packageVersion("plyr")        # 1.8.4
+library(twitteR)
+packageVersion("twitteR")     # 1.1.9
+library(slam)
+packageVersion("slam")        # 0.1.45
+library(caret)
+packageVersion("caret")       # 6.0.84
+packageVersion("lattice")     # 0.20.38      Package is loaded as dependency from caret
+library(ranger)
+packageVersion("ranger")      # 0.11.2
+library(rpart)
+packageVersion("rpart")       # 4.1.15
+library(rpart.plot)
+packageVersion("rpart.plot")  # 3.0.8
+library(xgboost)
+packageVersion("xgboost")     # 0.90.0.2
+library(e1071)
+packageVersion("e1071")       # 1.7.2
+```
+
+```{r Read Hand Coded Data, include=FALSE}
+data = read.csv("../data/coded-tweet-data.csv")
+attach(data)
+```
+
+
+
+```{r Text Cleaner, include=FALSE}
+text_cleaner<-function(corpus){
+  tempcorpus = lapply(corpus,toString)
+  for(i in 1:length(tempcorpus)){
+    tempcorpus[[i]]<-iconv(tempcorpus[[i]], "ASCII", "UTF-8", sub="")
+  }
+  tempcorpus = lapply(tempcorpus, tolower)
+  tempcorpus<-Corpus(VectorSource(tempcorpus))
+  toSpace <- content_transformer(function (x , pattern ) gsub(pattern, "", x))
+  
+  #Removing all the special charecters and words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "@")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "\\|")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "#")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "http")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "https")
+  tempcorpus <- tm_map(tempcorpus, toSpace, ".com")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "$")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "+")
+  tempcorpus <- tm_map(tempcorpus, removeNumbers)
+  # Remove english common stopwords
+  tempcorpus <- tm_map(tempcorpus, removeWords, stopwords("english"))
+  # Remove punctuation
+  tempcorpus <- tm_map(tempcorpus, removePunctuation)
+  
+  # Eliminate extra white spaces
+  tempcorpus <- tm_map(tempcorpus, stripWhitespace)
+  # Stem the document
+  tempcorpus <- tm_map(tempcorpus, PlainTextDocument)
+  tempcorpus <- tm_map(tempcorpus,  stemDocument, "english")
+  # Remove uninformative high-frequency words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "amp")
+  return(tempcorpus)
+}
+```
+
+```{r Cleaning the texts, include=FALSE}
+cleantweets <- text_cleaner(data$Text)
+```
+
+```{r Cereate DTM, include=FALSE}
+# Create TF-IDF
+dtm<-DocumentTermMatrix(cleantweets)
+
+print(dim(dtm))
+```
+
+```{r Remove sparse terms, include=FALSE}
+dtm <- removeSparseTerms(dtm, sparse=0.98)
+print(dim(dtm))
+```
+
+```{r DTM to dense, include=FALSE}
+dtm_mat<-as.matrix(dtm)
+```
+
+```{r Load and clean unseen, include=FALSE}
+twitterdata<-read.csv("../data/agency_tweets_database.csv")
+tweetstext = twitterdata$tweet_text
+
+# Clean the text
+tweetstext = sapply(tweetstext,toString)
+
+cleanads <- text_cleaner(tweetstext)
+```
+
+```{r, include=FALSE}
+moralJason<-ifelse(JasonCode == 2 , 1, 0)
+```
+
+
+```{r Prepare Data Structures, include=FALSE}
+############## Expert coder
+moral = moralJason
+mllabel = data.frame(moral,dtm_mat)
+
+```
+
+
+```{r, include = FALSE}
+set.seed(41616)
+train=sample(1:dim(mllabel)[1],
+             dim(mllabel)[1]*0.7)
+
+dtm_mat<-as.matrix(dtm)
+trainX = dtm_mat[train,]
+print(dim(trainX))
+
+testX = dtm_mat[-train,]
+print(dim(testX))
+
+trainY = moral[train]
+testY = moral[-train]
+
+traindata<-data.frame(trainY,trainX)
+testdata<-data.frame(testY,testX)
+
+traindata.b <- xgb.DMatrix(data = trainX,label = trainY) 
+testdata.b  <- xgb.DMatrix(data = testX,label=testY)
+
+pospredweight = as.vector(table(trainY)[1])/as.vector(table(trainY)[2])
+```
+
+```{r Create DTM for unseen data., include=FALSE}
+
+# dtm_all_ads is a sparse matrix in python terminology.
+dtm_all_ads<-DocumentTermMatrix(cleanads)    # <-- make document term matrix of all the cleaned unseen tweets
+
+trainset_colnames<-colnames(trainX)          # <-- retrieve the column names of the training set
+m <- matrix(0, ncol = length(trainset_colnames), nrow = dtm_all_ads[["nrow"]])      # <-- initialize an all-zero matrix. The columns are the word features from the training dtm. The rows represent the unseen tweets.
+
+for (idx in 1:length(dtm_all_ads[["i"]])){      # <-- Iterate over all the (non-zero) values in the sparse matrix
+   i = dtm_all_ads[["i"]][idx]                  # <-- Get the row coordinate of the nth (idx-th) value
+   j = dtm_all_ads[["j"]][idx]                  # <-- Get the collumn coordinate of the nth (idx-th) value
+   value = dtm_all_ads[["v"]][idx]              # <-- Get the value (word count) of the nth value
+   
+   word = dtm_all_ads[["dimnames"]][["Terms"]][j]                 # <-- retrieve the word that corresponds with the collumn index
+   word_index = match(word, trainset_colnames, nomatch = FALSE)   # <-- See whether the word is present as a feature in the training dtm. If it is, get the column index of the word in the training data. If it is not present, return false.
+   
+   if (word_index){                 # <-- if word_index == False, then the condition fails, if word index contains an actual index, the condition passes.
+      m[i, word_index] = value      # <-- add the value to the pre-initialized matrix
+   }
+   
+}
+
+print(dim(trainX))      # <-- produce some output to assess the result
+
+print(dim(m))           # <-- produce some output to assess the result
+
+dtm_mat_class <- m      # <-- assign to a new name so that the rest of the script will run normally.
+
+```
+
+
+
+## Get the number of tweets that have N rows.
+
+The following blocks of code recreate Table 1 from the paper
+
+#```{r}
+#get_example <- function(X, n){
+#  X[rowSums(dtm_mat) == 2,]
+#}
+#```
+
+This block of code counts the tweets with n words in the training data set:
+
+```{r}
+sum_of_rows = rowSums(dtm_mat, na.rm = FALSE, dims = 1)
+print(length(sum_of_rows))
+
+nr_zero_sums = sum(sum_of_rows == 0)
+
+relative_zero_sums = nr_zero_sums/nrow(dtm_mat)
+
+print(nr_zero_sums)
+print(relative_zero_sums)
+
+table(sum_of_rows)
+table(sum_of_rows)/nrow(dtm_mat)
+```
+
+This block of code counts the tweets with n words in the test data set:
+
+```{r}
+sum_of_rows = rowSums(dtm_mat_class, na.rm = FALSE, dims = 1)
+print(length(sum_of_rows))
+
+nr_zero_sums = sum(sum_of_rows == 0)
+
+relative_zero_sums = nr_zero_sums/nrow(dtm_mat_class)
+
+print(nr_zero_sums)
+print(relative_zero_sums)
+
+table(sum_of_rows)
+table(sum_of_rows)/nrow(dtm_mat_class)
+```
+
+The tables above together form table 1 in the paper.
+
+## Analyze document frequencies
+
+First create a dense matrix from the sparse matrix. This is needed for the upcoming analysis.
+
+```{r}
+dtm<-DocumentTermMatrix(cleantweets)
+dtm_dense<-as.matrix(dtm)
+dim(dtm_dense)
+```
+
+```{r}
+
+words_in_n_docs <- function(nonzero_count, max_n=dim(dtm)[2]){
+   #docfreq = data.frame(0, nrow=1, )
+   words_in_docs = c()
+   
+   for (n in 1:max_n){
+      words_in_docs = c(words_in_docs, sum(nonzero_count == n))
+   }
+   return(words_in_docs)
+   
+}
+
+#colSums(dtm_dense)
+nonzero_count = colSums(dtm_dense != 0)
+
+docfreq = words_in_n_docs(nonzero_count)
+
+docfreq[1:17]
+```
+
+The variable docfreq contains the input for figure 1 of the paper. These numbers can be interpreted as follows: there are 1149 words that occur in 1 document. There are 175 words that occur in 2 documents. In general: there are docfreq[i] words that occur in i documents, where i is the index in docfreq.
+
+I only print the first 17 instantces, since the rest is all zeroes.
+
+To prove this:
+
+```{r}
+sum(docfreq[1:17]) == sum(docfreq)
+```
+
+
+These numbers are the input for the jupyter notebook "bar_line_chart.ipynb" that is used to make te figure.
+

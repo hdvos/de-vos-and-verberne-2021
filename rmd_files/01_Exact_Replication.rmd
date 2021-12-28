@@ -1,0 +1,469 @@
+---
+title: "1 Exact Replication"
+author: "<Masked for review>"
+date: "29/11/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this Rmarkdown file we show how we replicated the analysis by Anastasopoulos and Whitford (2019) (A&W).
+
+Anastasopoulos, L. J., & Whitford, A. B. (2018). Machine Learning for Public Administration Research, with Application to Organizational Reputation.
+
+The text in this markdown is written by us. All code comes from the replication files from A&W unless stated otherwise.
+
+Note that the original script by A&W is written in a R-script. We converted it to a R-markdown file to increase its readability. We did only copy lines of code that were part of the replication. For the full code of A&W we would like to refer to the original paper.
+
+We organised the code in such a way that all filepaths are relative. This means that after unzipping, the code should run, given that all the packages are installer.
+
+## Importing libraries.
+
+There are a lot of R-libraries that are imported to make this code run.
+
+```{r Imports 1}
+library(foreign)
+packageVersion("foreign")     # 0.8.72
+library(ggplot2)
+packageVersion("ggplot2")     # 3.2.0
+
+library(tm)
+packageVersion("tm")          # 0.7.6
+packageVersion("NLP")         # 0.1.11       Package is loaded as dependency from tm
+library(SnowballC)
+packageVersion("SnowballC")   # 0.6.0
+library(plyr)
+packageVersion("plyr")        # 1.8.4
+library(twitteR)
+packageVersion("twitteR")     # 1.1.9
+library(slam)
+packageVersion("slam")        # 0.1.45
+library(caret)
+packageVersion("caret")       # 6.0.84
+packageVersion("lattice")     # 0.20.38      Package is loaded as dependency from caret
+library(ranger)
+packageVersion("ranger")      # 0.11.2
+library(rpart)
+packageVersion("rpart")       # 4.1.15
+library(rpart.plot)
+packageVersion("rpart.plot")  # 3.0.8
+library(xgboost)
+packageVersion("xgboost")     # 0.90.0.2
+library(e1071)
+packageVersion("e1071")       # 1.7.2
+```
+
+A&W do not report the versions of the packages used. We report the versions that we used for the replication below. Check if the output of the cell above is the same as in the table below. A diviation in package version does not necessary mean that the results will be invalid, but can explain if there are differences in the outcome.
+
+
+| Packagename | Version  |
+|-------------|----------|
+| foreign     | 0.8.72   |
+| ggplot2     | 3.2.0    |
+| tm          | 0.7.6    |
+| NLP         | 0.1.11   |
+| SnowballC   | 0.6.0    |
+| plyr        | 1.8.4    |
+| twitteR     | 1.1.9    |
+| slam        | 0.1.45   |
+| caret       | 6.0.84   |
+| lattice     | 0.20.38  |
+| ranger      | 0.11.2   |
+| rpart       | 4.1.15   |
+| rpart.plot  | 3.0.8    |
+| xgboost     | 0.90.0.2 |
+| e1071       | 1.7.2    |
+
+
+## Read The Hand Coded Data
+
+This code reads the hand coded data and attaches it to your R-studio environment.
+
+```{r Read Hand Coded Data}
+data = read.csv("../data/coded-tweet-data.csv")
+attach(data)
+```
+
+## Textcleaner
+
+Here the textcleaner function is defined. This function does most of the preprocessing of the text.
+
+```{r Text Cleaner}
+text_cleaner<-function(corpus){
+  tempcorpus = lapply(corpus,toString)
+  for(i in 1:length(tempcorpus)){
+    tempcorpus[[i]]<-iconv(tempcorpus[[i]], "ASCII", "UTF-8", sub="")
+  }
+  tempcorpus = lapply(tempcorpus, tolower)
+  tempcorpus<-Corpus(VectorSource(tempcorpus))
+  toSpace <- content_transformer(function (x , pattern ) gsub(pattern, "", x))
+  
+  #Removing all the special charecters and words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "@")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "\\|")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "#")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "http")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "https")
+  tempcorpus <- tm_map(tempcorpus, toSpace, ".com")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "$")
+  tempcorpus <- tm_map(tempcorpus, toSpace, "+")
+  tempcorpus <- tm_map(tempcorpus, removeNumbers)
+  # Remove english common stopwords
+  tempcorpus <- tm_map(tempcorpus, removeWords, stopwords("english"))
+  # Remove punctuation
+  tempcorpus <- tm_map(tempcorpus, removePunctuation)
+  
+  # Eliminate extra white spaces
+  tempcorpus <- tm_map(tempcorpus, stripWhitespace)
+  # Stem the document
+  tempcorpus <- tm_map(tempcorpus, PlainTextDocument)
+  tempcorpus <- tm_map(tempcorpus,  stemDocument, "english")
+  # Remove uninformative high-frequency words
+  tempcorpus <- tm_map(tempcorpus, toSpace, "amp")
+  return(tempcorpus)
+}
+```
+
+## Preprocessing the text.
+
+The following line of code calls the textcleaner function on the texts. This creates the "cleantweets" variable that contains a list of cleaned tweets
+
+```{r Cleaning the texts}
+cleantweets <- text_cleaner(data$Text)
+```
+
+We added the following lines in order to inspect what the cleaner has done.
+
+```{r Cleaner Pritouts}
+for (i in 1:10){
+   original_tweet = as.character(data$Text[i])
+   cleaned_tweet = cleantweets[[i]]$content
+   
+   print("++++++++++++++++++++++++++++++++++++++")
+   print(original_tweet)
+   print(cleaned_tweet)
+}
+```
+
+## Create a feature matrix
+
+With the following line A&W create what they call a TF-IDF, but what actually is NOT a TF-IDF as they do not weigh their features in any way.
+
+```{r Cereate DTM}
+# Create TF-IDF
+dtm<-DocumentTermMatrix(cleantweets)
+
+print(dim(dtm))
+```
+
+With the following line the Document Term Matrix (dtm) is made less sparse. This is done by removing sparse terms. This boils down to removing all terms that occur 3 times or less.
+
+```{r Remove sparse terms}
+dtm <- removeSparseTerms(dtm, sparse=0.98)
+print(dim(dtm))
+```
+
+The DTM is converted to a dense matrix for a little more ease of use.
+
+```{r DTM to dense}
+dtm_mat<-as.matrix(dtm)
+```
+
+## Recode
+
+In the machine learning experiment, there will only be a distinction between Moral Reputation and "other". The data need to be recoded, as happens here:
+```{r}
+moralJason<-ifelse(JasonCode == 2 , 1, 0)
+```
+
+# Train the model
+
+
+## Prepare data structures
+
+```{r Prepare Data Structures}
+############## Expert coder
+moral = moralJason
+mllabel = data.frame(moral,dtm_mat)
+
+```
+
+
+## Divide the data in a training set and a test set
+
+```{r}
+set.seed(41616)
+train=sample(1:dim(mllabel)[1],
+             dim(mllabel)[1]*0.7)
+
+dtm_mat<-as.matrix(dtm)
+trainX = dtm_mat[train,]
+print(dim(trainX))
+
+testX = dtm_mat[-train,]
+print(dim(testX))
+
+trainY = moral[train]
+testY = moral[-train]
+
+traindata<-data.frame(trainY,trainX)
+testdata<-data.frame(testY,testX)
+
+traindata.b <- xgb.DMatrix(data = trainX,label = trainY) 
+testdata.b  <- xgb.DMatrix(data = testX,label=testY)
+
+pospredweight = as.vector(table(trainY)[1])/as.vector(table(trainY)[2])
+```
+
+
+## Prepare the model parameters
+
+```{r}
+set.seed(100)
+
+# Parameter tuning
+# these are default parameters
+params <- list(booster = "gbtree", objective = "binary:logistic", 
+               eta=0.3, gamma=0, max_depth=6, min_child_weight=1, 
+               subsample=1, colsample_bytree=1)
+
+```
+
+# Tune the model parameters
+
+```{r, include}
+xgbcv <- xgb.cv( params = params, data = traindata.b,
+                 nrounds = 100, nfold = 5, showsd = T, 
+                 stratified = T, early.stopping.rounds = 20, print.every_n = 10,
+                 maximize = F,
+                 scale_pos_weight = pospredweight)
+```
+
+
+## Select the best model parameters
+
+```{r}
+# Which number of iterations has the lowest training error?
+best.iter = which(xgbcv$evaluation_log$test_error_mean ==  min(xgbcv$evaluation_log$test_error_mean))
+best.iter = best.iter[1]
+```
+
+
+## Train the definitive model based on optimal Parameters
+
+
+```{r}
+#first default - model training
+xgb1 <- xgb.train(params = params, data = traindata.b, 
+                  nrounds = best.iter, 
+                  watchlist = list(val=testdata.b,train=traindata.b),
+                  print.every_n = 10, early_stopping_rounds = 10, 
+                  maximize = F , eval_metric = "error",
+                  scale_pos_weight = pospredweight)
+
+
+```
+
+## Evaluate the model on the test set.
+
+```{r Evaluation 1}
+#model prediction
+xgbpred <- predict(xgb1,testdata.b)
+xgbpred <- ifelse(xgbpred > 0.5,1,0)
+```
+
+
+```{r Evaluation 2}
+perfJason = confusionMatrix(as.factor(xgbpred), as.factor(testY),positive="1")
+perfJason        # <-- HdVos I added this to get some insight in the preliminary results.
+```
+```{r Evaluation 3}
+perfJason$byClass[c(11,1,2,5,6,7)]
+```
+
+
+
+
+## Create Variable importance plot
+
+
+```{r Variable Importance Plot}
+## Variable importance plot
+mat <- xgb.importance(feature_names = colnames(trainX),model = xgb1)
+
+png("../figures/term-importance.png")
+xgb.plot.importance(importance_matrix = mat[1:10],
+                    xlab = "Information Gain",
+                    ylab = "Term")
+
+dev.off()
+```
+
+
+
+# Apply trained expert classifier to the unseen data
+
+## Load and clean the data
+
+```{r Load and clean unseen}
+twitterdata<-read.csv("../data/agency_tweets_database.csv")
+tweetstext = twitterdata$tweet_text
+
+# Clean the text
+tweetstext = sapply(tweetstext,toString)
+
+cleanads <- text_cleaner(tweetstext)
+```
+
+## Create a Document Term matrix (DTM)
+
+Here there is a bit of a problem. The tm-package does not split the "fit" and "transform" procedure for making count vectors like it happens in sklearn. As a result it is hard to load new data in an existing vector space (so that it has the same dimensionality).
+
+One needs to write a custom fit procedure. The procedure the authors wrote converts a sparse matrix to a dense matrix of (about) 26000 by 42000. This dense matrix is incredibly large (8.5 GB). This makes the whole procedure very slow (and also impossible to run on a computer with only 8 GB of RAM). For this reason I wrote my own function which is more memory efficient, and therefore even faster.
+
+I will first include the original code for sake of completenes. Yet I commented it out for easier compiling of the notebook. If you want to inspect this code, you can uncomment it.
+
+
+```{r}
+## Create TF-IDF
+# dtm_all_ads<-DocumentTermMatrix(cleanads)
+# dtm_all_mat<-as.matrix(dtm_all_ads)     
+
+## First step is to match the columns to subset 
+## Note: "trainX" will be the training data for whichever algorithm you trained last. 
+## Thus, if you trained on the "expert" coder data, this will be the training set here.
+
+#colnames<-colnames(trainX)    # <-- HdVos: What could possibly go wrong?
+#fullnames<-dtm_all_ads$dimnames$Terms
+#fullnames<-colnames(dtm_all_mat)
+#indexno<-c()
+
+#for(i in 1:length(colnames)){
+#  tempname = colnames[i]
+#  indexnum = which(tempname == fullnames)
+#  indexno = c(indexno, indexnum)
+#}
+
+#dtm_mat_class<-dtm_all_mat[,indexno]
+
+## Do the reverse because of matching problems
+#colnames<-colnames(dtm_mat_class)
+#fullnames<-dtm_all_ads$dimnames$Terms
+#fullnames<-colnames(trainX)
+#indexno<-c()
+
+#for(i in 1:length(colnames)){
+#  tempname = colnames[i]
+#  indexnum = which(tempname == fullnames)
+#  indexno = c(indexno, indexnum)
+#}
+#
+# trainX = trainX[,indexno]
+
+```
+
+The following is our re-implementation which does exactly the same as the code above yet quicker and with less memory usage.
+
+My code:
+
+```{r Create DTM for unseen data.}
+
+# dtm_all_ads is a sparse matrix in python terminology.
+dtm_all_ads<-DocumentTermMatrix(cleanads)    # <-- make document term matrix of all the cleaned unseen tweets
+
+trainset_colnames<-colnames(trainX)          # <-- retrieve the column names of the training set
+m <- matrix(0, ncol = length(trainset_colnames), nrow = dtm_all_ads[["nrow"]])      # <-- initialize an all-zero matrix. The columns are the word features from the training dtm. The rows represent the unseen tweets.
+
+for (idx in 1:length(dtm_all_ads[["i"]])){      # <-- Iterate over all the (non-zero) values in the sparse matrix
+   i = dtm_all_ads[["i"]][idx]                  # <-- Get the row coordinate of the nth (idx-th) value
+   j = dtm_all_ads[["j"]][idx]                  # <-- Get the collumn coordinate of the nth (idx-th) value
+   value = dtm_all_ads[["v"]][idx]              # <-- Get the value (word count) of the nth value
+   
+   word = dtm_all_ads[["dimnames"]][["Terms"]][j]                 # <-- retrieve the word that corresponds with the collumn index
+   word_index = match(word, trainset_colnames, nomatch = FALSE)   # <-- See whether the word is present as a feature in the training dtm. If it is, get the column index of the word in the training data. If it is not present, return false.
+   
+   if (word_index){                 # <-- if word_index == False, then the condition fails, if word index contains an actual index, the condition passes.
+      m[i, word_index] = value      # <-- add the value to the pre-initialized matrix
+   }
+   
+}
+
+print(dim(trainX))      # <-- produce some output to assess the result
+
+print(dim(m))           # <-- produce some output to assess the result
+
+dtm_mat_class <- m      # <-- assign to a new name so that the rest of the script will run normally.
+
+```
+
+## Make predictions
+
+```{r}
+# Now we can predict using the model
+xgbpred <- predict(xgb1,dtm_mat_class)
+
+# Create a plot of the predicted probabilities for 1978 and 1982
+
+xgbpred.class <- ifelse(xgbpred > 0.5,1,0)
+```
+
+# Agencies analysis
+
+### Prepare agencies data:
+```{r}
+####################################################################################
+####################################################################################
+####################################################################################
+# Now let's do summaries by agency for % of tweets related to moral reputation
+agencies<-levels(factor(twitterdata$agency_id))
+full.agencies = twitterdata$agency_id
+
+
+pctmoral<-c()
+lowerbound<-c()
+upperbound<-c()
+```
+
+Determine percentage of moral tweets:
+
+```{r}
+for(agency in agencies){
+  moraltemp = xgbpred.class[full.agencies == agency]
+  p = mean(moraltemp,na.rm = TRUE)
+  cis = p + c(-qnorm(0.975),qnorm(0.975))*sqrt((1/length(moraltemp))*p*(1-p))
+  lower = cis[1]
+  upper = cis[2]
+  
+  pctmoral<-c(pctmoral,p)
+  lowerbound<-c(lowerbound, lower)
+  upperbound<-c(upperbound, upper)
+}
+```
+
+## Create Plot
+
+```{r}
+# Create a ggplot with the 95% confidence intervals
+df = data.frame(
+  Percent.Moral = pctmoral,
+  Lower = lowerbound,
+  Upper = upperbound,
+  Agency = agencies
+)
+
+
+# Show the between-S CI's in red, and the within-S CI's in black
+ggplot(df, aes(x=reorder(Agency,Percent.Moral), y=Percent.Moral, group=1)) +
+  geom_errorbar(width=.2, aes(ymin=Lower, ymax=Upper), colour="red") +
+  geom_point(shape=21, size=3, fill="black") + xlab("Agency") + 
+  ylab("% Moral Reputation Tweets") + coord_flip() +
+  theme_bw() + theme(axis.text=element_text(size=15),
+                     axis.title=element_text(size=14,face="bold")) 
+
+ggsave("../figures/pctmoralall.png", height = 8, width = 9.5) # <- HdVos: added aspect ratio to match the ratio of the original.
+
+```
